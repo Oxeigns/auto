@@ -7,7 +7,7 @@ import traceback
 from pyrogram import Client
 from pyrogram.enums import ChatMemberStatus
 from pyrogram.types import ChatJoinRequest
-from pyrogram.errors import FloodWait, UserAlreadyParticipant
+from pyrogram.errors import FloodWait, UserAlreadyParticipant, UserChannelsTooMuch
 
 # ================== CONFIG ==================
 API_ID = int(os.getenv("API_ID"))
@@ -16,9 +16,7 @@ SESSION_STRING = os.getenv("SESSION_STRING")
 
 INVITE_LINK = "https://t.me/+e8h5_XQmY5szYjUx"
 
-# ✅ Auto defaults (no need Heroku vars)
-# - CONCURRENCY auto set from CPU (min 2, max 6)
-# - APM auto-tunes between MIN_APPROVALS_PER_MIN and MAX_APPROVALS_PER_MIN_CAP
+# Auto defaults (no need Heroku vars, but you CAN override via env)
 RESCAN_EVERY_MINUTES = int(os.getenv("RESCAN_EVERY_MINUTES", "1"))
 
 MIN_APPROVALS_PER_MIN = int(os.getenv("MIN_APPROVALS_PER_MIN", "30"))
@@ -28,6 +26,9 @@ START_APPROVALS_PER_MIN = int(os.getenv("START_APPROVALS_PER_MIN", "80"))
 BASE_BACKOFF_SEC = float(os.getenv("BASE_BACKOFF_SEC", "0.0"))
 STATS_INTERVAL_SEC = int(os.getenv("STATS_INTERVAL_SEC", "60"))
 RECENT_TTL_SEC = int(os.getenv("RECENT_TTL_SEC", "3600"))  # 1 hour
+
+# Block users that can never be approved (e.g., USER_CHANNELS_TOO_MUCH)
+BLOCK_TTL_SEC = int(os.getenv("BLOCK_TTL_SEC", "86400"))  # 24 hours
 
 TUNE_STEP_UP = int(os.getenv("TUNE_STEP_UP", "10"))
 TUNE_STEP_DOWN = int(os.getenv("TUNE_STEP_DOWN", "20"))
@@ -41,11 +42,9 @@ def log(msg: str):
 
 # ---------------- AUTO CONCURRENCY (no vars needed) ----------------
 def auto_concurrency() -> int:
-    # Heroku usually reports 1 CPU; still we choose a safe default range
     cpu = os.cpu_count() or 1
-    # good heuristic: 2 on low CPU, 4 on moderate, cap at 6
     if cpu <= 1:
-        return 4  # still safe because we rate-limit
+        return 4  # safe default; rate-limit will protect
     if cpu == 2:
         return 4
     return min(6, max(2, cpu))
@@ -60,6 +59,8 @@ stats = {
     "errors": 0,
     "floodwaits": 0,
     "skipped_dup": 0,
+    "skipped_blocked": 0,
+    "skipped_too_many_channels": 0,
     "accept_errs": 0,
     "smooth_success": 0,
 }
@@ -79,6 +80,21 @@ def dup_check_and_mark(user_id: int) -> bool:
         return True
 
     recent_seen[user_id] = now
+    return False
+
+
+# ---------------- BLOCKLIST (to stop repeated spam errors) ----------------
+blocked_until = {}  # user_id -> unblock_timestamp
+
+
+def is_blocked(user_id: int) -> bool:
+    now = time.time()
+    u = blocked_until.get(user_id)
+    if u and now < u:
+        stats["skipped_blocked"] += 1
+        return True
+    if u and now >= u:
+        blocked_until.pop(user_id, None)
     return False
 
 
@@ -186,6 +202,12 @@ def extract_user_id(item):
 
 
 async def approve_user(client: Client, chat_id: int, user_id: int, tag: str) -> bool:
+    # Stop repeated spam errors
+    if is_blocked(user_id):
+        log(f"[SKIP_BLOCKED] user_id={user_id}")
+        return False
+
+    # Skip duplicates
     if dup_check_and_mark(user_id):
         log(f"[SKIP_DUP] user_id={user_id}")
         return False
@@ -204,6 +226,13 @@ async def approve_user(client: Client, chat_id: int, user_id: int, tag: str) -> 
         await decay_backoff()
         await tune_up_if_smooth()
         return True
+
+    except UserChannelsTooMuch:
+        # Telegram doesn't allow approval for this user (already too many channels)
+        stats["skipped_too_many_channels"] += 1
+        blocked_until[user_id] = time.time() + BLOCK_TTL_SEC
+        log(f"[SKIP_TOO_MANY_CHANNELS] user_id={user_id} blocked_for={BLOCK_TTL_SEC}s")
+        return False
 
     except FloodWait as e:
         stats["floodwaits"] += 1
@@ -301,6 +330,8 @@ async def main():
                     f"accepted={stats['accepted']} pending_last={stats['pending_last']} "
                     f"errors={stats['errors']} accept_errs={stats['accept_errs']} "
                     f"floodwaits={stats['floodwaits']} skipped_dup={stats['skipped_dup']} "
+                    f"skipped_blocked={stats['skipped_blocked']} "
+                    f"skipped_too_many_channels={stats['skipped_too_many_channels']} "
                     f"apm={apm}/min backoff={b:.2f}s conc={CONCURRENCY}"
                 )
             except Exception:
@@ -309,7 +340,11 @@ async def main():
 
     async with app:
         log("Userbot started ✅")
-        log(f"[BOOT] conc={CONCURRENCY} start_apm={START_APPROVALS_PER_MIN}/min range={MIN_APPROVALS_PER_MIN}-{MAX_APPROVALS_PER_MIN_CAP}/min")
+        log(
+            f"[BOOT] conc={CONCURRENCY} start_apm={START_APPROVALS_PER_MIN}/min "
+            f"range={MIN_APPROVALS_PER_MIN}-{MAX_APPROVALS_PER_MIN_CAP}/min "
+            f"block_ttl={BLOCK_TTL_SEC}s"
+        )
 
         try:
             await app.join_chat(INVITE_LINK)
