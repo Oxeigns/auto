@@ -2,12 +2,12 @@ import os
 import asyncio
 import time
 import signal
+import traceback
 
 from pyrogram import Client
 from pyrogram.enums import ChatMemberStatus
 from pyrogram.types import ChatJoinRequest
-from pyrogram.errors import FloodWait, PeerIdInvalid, UserAlreadyParticipant
-
+from pyrogram.errors import FloodWait, UserAlreadyParticipant
 
 # ================== CONFIG ==================
 
@@ -15,16 +15,18 @@ API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
 
-# ✅ Your channel invite link (hard-coded)
 INVITE_LINK = "https://t.me/+e8h5_XQmY5szYjUx"
 
-PER_APPROVE_DELAY_SEC = 0.7
-MAX_APPROVALS_PER_MINUTE = 50
-RESCAN_EVERY_MINUTES = 10
+PER_APPROVE_DELAY_SEC = float(os.getenv("PER_APPROVE_DELAY_SEC", "0.7"))
+MAX_APPROVALS_PER_MINUTE = int(os.getenv("MAX_APPROVALS_PER_MINUTE", "50"))
+RESCAN_EVERY_MINUTES = int(os.getenv("RESCAN_EVERY_MINUTES", "10"))
 
 # ============================================
 
 rate_bucket = []
+
+def log(msg: str):
+    print(msg, flush=True)
 
 async def rate_limit():
     now = time.time()
@@ -40,77 +42,75 @@ async def check_and_log_permission(client: Client, chat_id: int) -> bool:
     me = await client.get_me()
     member = await client.get_chat_member(chat_id, me.id)
 
-    status = member.status  # enum
+    status = member.status
     priv = getattr(member, "privileges", None)
-
     can_invite = getattr(priv, "can_invite_users", None)
     can_manage = getattr(priv, "can_manage_chat", None)
-    can_restrict = getattr(priv, "can_restrict_members", None)
-    can_promote = getattr(priv, "can_promote_members", None)
 
-    print(
-        f"[PERM] me={me.id} status={status} "
-        f"can_invite={can_invite} can_manage={can_manage} "
-        f"can_restrict={can_restrict} can_promote={can_promote}"
-    )
+    log(f"[PERM] me={me.id} status={status} can_invite={can_invite} can_manage={can_manage}")
 
+    # Owner ok
     if status == ChatMemberStatus.OWNER:
         return True
 
+    # Admin required
     if status != ChatMemberStatus.ADMINISTRATOR:
         return False
 
-    # For channel join-requests, invite/manage is typically sufficient
-    return bool(can_invite or can_manage)
+    # Many channels work with invite/manage; if privileges missing, still try.
+    return True
 
 async def approve_user(client: Client, chat_id: int, user_id: int, tag: str) -> bool:
     await rate_limit()
     try:
         await client.approve_chat_join_request(chat_id, user_id)
-        print(f"[APPROVED] {tag} user_id={user_id}")
+        log(f"[ACCEPTED] {tag} user_id={user_id}")
         await asyncio.sleep(PER_APPROVE_DELAY_SEC)
         return True
     except FloodWait as e:
-        print(f"[FLOODWAIT] {e.value}s")
+        log(f"[FLOODWAIT] {e.value}s")
         await asyncio.sleep(e.value)
         return False
     except Exception as ex:
-        print(f"[APPROVE_ERR] tag={tag} user_id={user_id} ex={ex}")
+        log(f"[ACCEPT_ERR] {tag} user_id={user_id} ex={ex}")
+        log(traceback.format_exc())
         return False
 
-async def backlog_scan(client: Client, chat_id: int):
-    accepted = 0
-    pending = 0
+async def drain_pending_requests(client: Client, chat_id: int):
+    """
+    Drain until pending becomes 0.
+    Prints:
+      - accepted_total
+      - pending_seen_this_round
+    """
+    accepted_total = 0
 
-    try:
-        ok = await check_and_log_permission(client, chat_id)
-        if not ok:
-            print(f"[NO_PERMISSION] chat_id={chat_id}")
-            return accepted, pending
+    while True:
+        pending = 0
+        accepted_round = 0
 
-        # Warm up peer
-        await client.get_chat(chat_id)
-
-        async for item in client.get_chat_join_requests(chat_id):
+        async for req in client.get_chat_join_requests(chat_id):
             pending += 1
-            uid = getattr(item, "user_id", None) or getattr(getattr(item, "from_user", None), "id", None)
+            uid = getattr(req, "user_id", None) or getattr(getattr(req, "from_user", None), "id", None)
             if not uid:
-                print("[WARN] pending item without user_id")
+                log("[WARN] request item has no user_id")
                 continue
 
             if await approve_user(client, chat_id, uid, tag="OLD"):
-                accepted += 1
+                accepted_round += 1
 
-    except PeerIdInvalid:
-        print("[PEER_INVALID] chat not resolved/joined")
-    except FloodWait as e:
-        print(f"[FLOODWAIT] {e.value}s")
-        await asyncio.sleep(e.value)
-    except Exception as ex:
-        print(f"[SCAN_ERR] ex={ex}")
+        accepted_total += accepted_round
+        log(f"[DRAIN_ROUND] accepted_round={accepted_round} pending_seen={pending}")
 
-    print(f"[SCAN_SUMMARY] chat_id={chat_id} accepted={accepted} pending_seen={pending}")
-    return accepted, pending
+        # If no pending found, we're done draining
+        if pending == 0:
+            break
+
+        # Safety: small pause then rescan
+        await asyncio.sleep(2)
+
+    log(f"[DRAIN_DONE] accepted_total={accepted_total}")
+    return accepted_total
 
 async def main():
     stop_event = asyncio.Event()
@@ -128,53 +128,52 @@ async def main():
         "user",
         api_id=API_ID,
         api_hash=API_HASH,
-        session_string=SESSION_STRING
+        session_string=SESSION_STRING,
     )
 
     async with app:
-        print("Userbot started ✅")
+        log("Userbot started ✅")
 
-        # Join channel via invite link (userbot account)
+        # Ensure user joined
         try:
             await app.join_chat(INVITE_LINK)
-            print("Joined channel via invite link ✅")
+            log("Joined channel via invite link ✅")
         except UserAlreadyParticipant:
-            print("Already joined channel ✅")
+            log("Already joined channel ✅")
 
         # Resolve chat id
         chat = await app.get_chat(INVITE_LINK)
         CHAT_ID = chat.id
-        print("Resolved chat ID:", CHAT_ID)
+        log(f"Resolved chat ID: {CHAT_ID}")
 
-        # New join requests
+        # Permission check
+        ok = await check_and_log_permission(app, CHAT_ID)
+        if not ok:
+            log(f"[NO_PERMISSION] chat_id={CHAT_ID} (session user is not admin/owner)")
+            return
+
+        # New join requests (instant accept)
         @app.on_chat_join_request()
         async def handler(client: Client, req: ChatJoinRequest):
             try:
                 if req.chat.id != CHAT_ID:
                     return
-
-                ok = await check_and_log_permission(client, CHAT_ID)
-                if not ok:
-                    print(f"[NO_PERMISSION] new_request chat_id={CHAT_ID}")
-                    return
-
                 await approve_user(client, CHAT_ID, req.from_user.id, tag="NEW")
-            except FloodWait as e:
-                await asyncio.sleep(e.value)
             except Exception as ex:
-                print("[HANDLER_ERR]", ex)
+                log(f"[HANDLER_ERR] {ex}")
+                log(traceback.format_exc())
 
-        # Initial scan
-        await backlog_scan(app, CHAT_ID)
+        # Drain old pending requests completely
+        await drain_pending_requests(app, CHAT_ID)
 
-        # Periodic scan
+        # Periodic rescans (in case Telegram missed events)
         while not stop_event.is_set():
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=RESCAN_EVERY_MINUTES * 60)
             except asyncio.TimeoutError:
-                await backlog_scan(app, CHAT_ID)
+                await drain_pending_requests(app, CHAT_ID)
 
-        print("Stopping userbot...")
+        log("Stopping userbot...")
 
 if __name__ == "__main__":
     asyncio.run(main())
