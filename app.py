@@ -15,6 +15,7 @@ API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
 
+# ✅ Channel invite link (hard-coded)
 INVITE_LINK = "https://t.me/+e8h5_XQmY5szYjUx"
 
 PER_APPROVE_DELAY_SEC = float(os.getenv("PER_APPROVE_DELAY_SEC", "0.7"))
@@ -25,8 +26,10 @@ RESCAN_EVERY_MINUTES = int(os.getenv("RESCAN_EVERY_MINUTES", "10"))
 
 rate_bucket = []
 
+
 def log(msg: str):
     print(msg, flush=True)
+
 
 async def rate_limit():
     now = time.time()
@@ -38,27 +41,26 @@ async def rate_limit():
             await asyncio.sleep(sleep_for)
     rate_bucket.append(time.time())
 
+
 async def check_and_log_permission(client: Client, chat_id: int) -> bool:
     me = await client.get_me()
     member = await client.get_chat_member(chat_id, me.id)
 
-    status = member.status
+    status = member.status  # enum
     priv = getattr(member, "privileges", None)
     can_invite = getattr(priv, "can_invite_users", None)
     can_manage = getattr(priv, "can_manage_chat", None)
 
     log(f"[PERM] me={me.id} status={status} can_invite={can_invite} can_manage={can_manage}")
 
-    # Owner ok
     if status == ChatMemberStatus.OWNER:
         return True
-
-    # Admin required
     if status != ChatMemberStatus.ADMINISTRATOR:
         return False
 
-    # Many channels work with invite/manage; if privileges missing, still try.
+    # Even if privileges don't show perfectly, still try (Telegram enforces on action).
     return True
+
 
 async def approve_user(client: Client, chat_id: int, user_id: int, tag: str) -> bool:
     await rate_limit()
@@ -76,12 +78,38 @@ async def approve_user(client: Client, chat_id: int, user_id: int, tag: str) -> 
         log(traceback.format_exc())
         return False
 
+
+def extract_user_id(item):
+    """
+    Backlog items can be ChatJoiner-like: item.user.id
+    Event items are ChatJoinRequest: req.from_user.id
+    """
+    u = getattr(item, "user", None)
+    if u is not None:
+        uid = getattr(u, "id", None)
+        if uid:
+            return uid
+
+    fu = getattr(item, "from_user", None)
+    if fu is not None:
+        uid = getattr(fu, "id", None)
+        if uid:
+            return uid
+
+    uid = getattr(item, "user_id", None)
+    if uid:
+        return uid
+
+    return None
+
+
 async def drain_pending_requests(client: Client, chat_id: int):
     """
-    Drain until pending becomes 0.
-    Prints:
-      - accepted_total
-      - pending_seen_this_round
+    Drains backlog until pending is 0.
+    Logs:
+      - [ACCEPTED] for each accepted
+      - [DRAIN_ROUND] accepted_round / pending_seen
+      - [DRAIN_DONE] total accepted
     """
     accepted_total = 0
 
@@ -89,11 +117,11 @@ async def drain_pending_requests(client: Client, chat_id: int):
         pending = 0
         accepted_round = 0
 
-        async for req in client.get_chat_join_requests(chat_id):
+        async for item in client.get_chat_join_requests(chat_id):
             pending += 1
-            uid = getattr(req, "user_id", None) or getattr(getattr(req, "from_user", None), "id", None)
+            uid = extract_user_id(item)
             if not uid:
-                log("[WARN] request item has no user_id")
+                log(f"[SKIP] cannot extract user_id from item_type={type(item)}")
                 continue
 
             if await approve_user(client, chat_id, uid, tag="OLD"):
@@ -102,15 +130,14 @@ async def drain_pending_requests(client: Client, chat_id: int):
         accepted_total += accepted_round
         log(f"[DRAIN_ROUND] accepted_round={accepted_round} pending_seen={pending}")
 
-        # If no pending found, we're done draining
         if pending == 0:
             break
 
-        # Safety: small pause then rescan
         await asyncio.sleep(2)
 
     log(f"[DRAIN_DONE] accepted_total={accepted_total}")
     return accepted_total
+
 
 async def main():
     stop_event = asyncio.Event()
@@ -134,7 +161,7 @@ async def main():
     async with app:
         log("Userbot started ✅")
 
-        # Ensure user joined
+        # Ensure joined
         try:
             await app.join_chat(INVITE_LINK)
             log("Joined channel via invite link ✅")
@@ -166,7 +193,7 @@ async def main():
         # Drain old pending requests completely
         await drain_pending_requests(app, CHAT_ID)
 
-        # Periodic rescans (in case Telegram missed events)
+        # Periodic rescans
         while not stop_event.is_set():
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=RESCAN_EVERY_MINUTES * 60)
@@ -174,6 +201,7 @@ async def main():
                 await drain_pending_requests(app, CHAT_ID)
 
         log("Stopping userbot...")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
