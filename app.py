@@ -12,7 +12,6 @@ API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
 
-# 🔥 DIRECT INVITE LINK HERE
 INVITE_LINK = "https://t.me/+e8h5_XQmY5szYjUx"
 
 PER_APPROVE_DELAY_SEC = 0.7
@@ -28,7 +27,9 @@ async def rate_limit():
     global rate_bucket
     rate_bucket = [t for t in rate_bucket if now - t < 60]
     if len(rate_bucket) >= MAX_APPROVALS_PER_MINUTE:
-        await asyncio.sleep(60 - (now - rate_bucket[0]))
+        sleep_for = 60 - (now - rate_bucket[0])
+        if sleep_for > 0:
+            await asyncio.sleep(sleep_for)
     rate_bucket.append(time.time())
 
 async def has_permission(client: Client, chat_id: int) -> bool:
@@ -37,17 +38,16 @@ async def has_permission(client: Client, chat_id: int) -> bool:
 
     if member.status not in ("administrator", "owner"):
         return False
-
     if member.privileges:
-        return member.privileges.can_invite_users
-
+        return bool(member.privileges.can_invite_users)
     return True
 
-async def approve(req: ChatJoinRequest, old=False):
+async def approve_user(client: Client, chat_id: int, user_id: int, old: bool = False):
     await rate_limit()
     try:
-        await req.approve()
-        print(("OLD" if old else "NEW"), "approved:", req.from_user.id)
+        # ✅ Correct method (works for both new events + backlog items)
+        await client.approve_chat_join_request(chat_id, user_id)
+        print(("OLD" if old else "NEW"), "approved:", user_id)
         await asyncio.sleep(PER_APPROVE_DELAY_SEC)
     except FloodWait as e:
         await asyncio.sleep(e.value)
@@ -58,8 +58,11 @@ async def main():
     def shutdown(*_):
         stop_event.set()
 
-    signal.signal(signal.SIGTERM, shutdown)
-    signal.signal(signal.SIGINT, shutdown)
+    try:
+        signal.signal(signal.SIGTERM, shutdown)
+        signal.signal(signal.SIGINT, shutdown)
+    except Exception:
+        pass
 
     app = Client(
         "user",
@@ -71,42 +74,55 @@ async def main():
     async with app:
         print("Userbot started ✅")
 
-        # ✅ JOIN VIA INVITE LINK
+        # ✅ Join via invite link (userbot account)
         try:
             await app.join_chat(INVITE_LINK)
             print("Joined channel via invite link ✅")
         except UserAlreadyParticipant:
             print("Already joined channel ✅")
 
-        # ✅ RESOLVE CHAT (NO PEER ERROR)
+        # ✅ Resolve chat
         chat = await app.get_chat(INVITE_LINK)
         CHAT_ID = chat.id
         print("Resolved chat ID:", CHAT_ID)
 
+        # ✅ New join requests
         @app.on_chat_join_request()
         async def handler(client: Client, req: ChatJoinRequest):
-            if req.chat.id == CHAT_ID:
-                if await has_permission(client, CHAT_ID):
-                    await approve(req)
+            try:
+                if req.chat.id == CHAT_ID and await has_permission(client, CHAT_ID):
+                    await approve_user(client, CHAT_ID, req.from_user.id, old=False)
+            except FloodWait as e:
+                await asyncio.sleep(e.value)
+            except Exception as ex:
+                print("Handler error:", ex)
 
-        # 🔁 BACKLOG SCAN
+        # ✅ Backlog scan
         async def clear_old():
             try:
-                async for req in app.get_chat_join_requests(CHAT_ID):
-                    await approve(req, old=True)
+                if not await has_permission(app, CHAT_ID):
+                    print("No permission in", CHAT_ID)
+                    return
+
+                async for j in app.get_chat_join_requests(CHAT_ID):
+                    # j may be ChatJoiner-like → use user_id safely
+                    uid = getattr(j, "user_id", None) or getattr(getattr(j, "from_user", None), "id", None)
+                    if uid:
+                        await approve_user(app, CHAT_ID, uid, old=True)
+
             except PeerIdInvalid:
                 print("Peer not resolved – userbot not joined")
             except FloodWait as e:
                 await asyncio.sleep(e.value)
+            except Exception as ex:
+                print("Clear old error:", ex)
 
         await clear_old()
 
+        # ✅ Periodic rescan
         while not stop_event.is_set():
             try:
-                await asyncio.wait_for(
-                    stop_event.wait(),
-                    timeout=RESCAN_EVERY_MINUTES * 60
-                )
+                await asyncio.wait_for(stop_event.wait(), timeout=RESCAN_EVERY_MINUTES * 60)
             except asyncio.TimeoutError:
                 await clear_old()
 
