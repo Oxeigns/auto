@@ -1,8 +1,8 @@
 {
   "name": "Auto Approve Pro",
-  "description": "Auto approve Telegram join requests using Pyrogram user session (old + new).",
+  "description": "Auto-approve Telegram channel join requests using Pyrogram USER session (fast backlog drain + new requests).",
   "repository": "https://github.com/Oxeigns/auto",
-  "keywords": ["telegram", "pyrogram", "auto-approve", "heroku"],
+  "keywords": ["telegram", "pyrogram", "userbot", "auto-approve", "heroku"],
   "formation": {
     "worker": {
       "quantity": 1
@@ -10,29 +10,43 @@
   },
   "env": {
     "API_ID": {
-      "description": "Telegram API ID (my.telegram.org)",
+      "description": "Telegram API ID (from my.telegram.org)",
       "required": true
     },
     "API_HASH": {
-      "description": "Telegram API HASH (my.telegram.org)",
+      "description": "Telegram API HASH (from my.telegram.org)",
       "required": true
     },
     "SESSION_STRING": {
-      "description": "Pyrogram USER session string",
+      "description": "Pyrogram USER session string (the user must be admin in the channel)",
       "required": true
     },
-    "TARGET_CHAT_IDS": {
-      "description": "Comma separated chat IDs (example: -100123,-100456)",
-      "required": true
+
+    "INVITE_LINK": {
+      "description": "Channel invite link (https://t.me/+xxxx) or @username (only used if you update app.py to read env)",
+      "value": "https://t.me/+e8h5_XQmY5szYjUx",
+      "required": false
     },
-    "PER_APPROVE_DELAY_SEC": {
-      "value": "0.7"
-    },
+
     "MAX_APPROVALS_PER_MINUTE": {
-      "value": "50"
+      "description": "Approvals per minute limit (higher = faster, can cause FloodWait)",
+      "value": "80",
+      "required": false
+    },
+    "CONCURRENCY": {
+      "description": "Parallel approval workers (2-6 recommended)",
+      "value": "4",
+      "required": false
     },
     "RESCAN_EVERY_MINUTES": {
-      "value": "10"
+      "description": "Backup rescan interval (minutes)",
+      "value": "1",
+      "required": false
+    },
+    "BASE_BACKOFF_SEC": {
+      "description": "Initial backoff delay (seconds)",
+      "value": "0",
+      "required": false
     }
   },
   "stack": "heroku-22"
