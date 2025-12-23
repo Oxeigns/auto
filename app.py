@@ -10,43 +10,147 @@ from pyrogram.types import ChatJoinRequest
 from pyrogram.errors import FloodWait, UserAlreadyParticipant
 
 # ================== CONFIG ==================
-
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
 
-# ✅ Channel invite link (hard-coded)
 INVITE_LINK = "https://t.me/+e8h5_XQmY5szYjUx"
 
-PER_APPROVE_DELAY_SEC = float(os.getenv("PER_APPROVE_DELAY_SEC", "0.7"))
-MAX_APPROVALS_PER_MINUTE = int(os.getenv("MAX_APPROVALS_PER_MINUTE", "50"))
-RESCAN_EVERY_MINUTES = int(os.getenv("RESCAN_EVERY_MINUTES", "10"))
+# ✅ Auto defaults (no need Heroku vars)
+# - CONCURRENCY auto set from CPU (min 2, max 6)
+# - APM auto-tunes between MIN_APPROVALS_PER_MIN and MAX_APPROVALS_PER_MIN_CAP
+RESCAN_EVERY_MINUTES = int(os.getenv("RESCAN_EVERY_MINUTES", "1"))
 
+MIN_APPROVALS_PER_MIN = int(os.getenv("MIN_APPROVALS_PER_MIN", "30"))
+MAX_APPROVALS_PER_MIN_CAP = int(os.getenv("MAX_APPROVALS_PER_MIN_CAP", "180"))
+START_APPROVALS_PER_MIN = int(os.getenv("START_APPROVALS_PER_MIN", "80"))
+
+BASE_BACKOFF_SEC = float(os.getenv("BASE_BACKOFF_SEC", "0.0"))
+STATS_INTERVAL_SEC = int(os.getenv("STATS_INTERVAL_SEC", "60"))
+RECENT_TTL_SEC = int(os.getenv("RECENT_TTL_SEC", "3600"))  # 1 hour
+
+TUNE_STEP_UP = int(os.getenv("TUNE_STEP_UP", "10"))
+TUNE_STEP_DOWN = int(os.getenv("TUNE_STEP_DOWN", "20"))
+SMOOTH_SUCCESS_TARGET = int(os.getenv("SMOOTH_SUCCESS_TARGET", "30"))
 # ============================================
-
-rate_bucket = []
 
 
 def log(msg: str):
     print(msg, flush=True)
 
 
-async def rate_limit():
+# ---------------- AUTO CONCURRENCY (no vars needed) ----------------
+def auto_concurrency() -> int:
+    # Heroku usually reports 1 CPU; still we choose a safe default range
+    cpu = os.cpu_count() or 1
+    # good heuristic: 2 on low CPU, 4 on moderate, cap at 6
+    if cpu <= 1:
+        return 4  # still safe because we rate-limit
+    if cpu == 2:
+        return 4
+    return min(6, max(2, cpu))
+
+CONCURRENCY = int(os.getenv("CONCURRENCY", str(auto_concurrency())))
+
+
+# ---------------- STATS ----------------
+stats = {
+    "accepted": 0,
+    "pending_last": 0,
+    "errors": 0,
+    "floodwaits": 0,
+    "skipped_dup": 0,
+    "accept_errs": 0,
+    "smooth_success": 0,
+}
+
+# ---------------- DUPLICATE SKIP ----------------
+recent_seen = {}  # user_id -> timestamp
+
+
+def dup_check_and_mark(user_id: int) -> bool:
     now = time.time()
-    global rate_bucket
-    rate_bucket = [t for t in rate_bucket if now - t < 60]
-    if len(rate_bucket) >= MAX_APPROVALS_PER_MINUTE:
-        sleep_for = 60 - (now - rate_bucket[0])
-        if sleep_for > 0:
-            await asyncio.sleep(sleep_for)
-    rate_bucket.append(time.time())
+    for k, t in list(recent_seen.items()):
+        if now - t > RECENT_TTL_SEC:
+            del recent_seen[k]
+
+    if user_id in recent_seen:
+        stats["skipped_dup"] += 1
+        return True
+
+    recent_seen[user_id] = now
+    return False
 
 
+# ---------------- RATE LIMIT + BACKOFF + AUTO APM ----------------
+_rate_lock = asyncio.Lock()
+_last_sent = 0.0
+
+_backoff = BASE_BACKOFF_SEC
+_backoff_lock = asyncio.Lock()
+
+_apm = START_APPROVALS_PER_MIN
+_apm_lock = asyncio.Lock()
+
+
+async def get_apm() -> int:
+    async with _apm_lock:
+        return _apm
+
+
+async def set_apm(new_val: int):
+    global _apm
+    async with _apm_lock:
+        _apm = max(MIN_APPROVALS_PER_MIN, min(MAX_APPROVALS_PER_MIN_CAP, int(new_val)))
+
+
+async def tune_down():
+    cur = await get_apm()
+    await set_apm(cur - TUNE_STEP_DOWN)
+
+
+async def tune_up_if_smooth():
+    if stats["smooth_success"] >= SMOOTH_SUCCESS_TARGET:
+        cur = await get_apm()
+        await set_apm(cur + TUNE_STEP_UP)
+        stats["smooth_success"] = 0
+
+
+async def rate_limit():
+    global _last_sent
+    async with _rate_lock:
+        apm = await get_apm()
+        min_interval = 60.0 / max(1, apm)
+        now = time.time()
+        wait = (_last_sent + min_interval) - now
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _last_sent = time.time()
+
+
+async def get_backoff() -> float:
+    async with _backoff_lock:
+        return _backoff
+
+
+async def bump_backoff(seconds: float):
+    global _backoff
+    async with _backoff_lock:
+        _backoff = min(10.0, max(_backoff, float(seconds)))
+
+
+async def decay_backoff():
+    global _backoff
+    async with _backoff_lock:
+        _backoff = max(BASE_BACKOFF_SEC, _backoff * 0.85)
+
+
+# ---------------- PERMISSION ----------------
 async def check_and_log_permission(client: Client, chat_id: int) -> bool:
     me = await client.get_me()
     member = await client.get_chat_member(chat_id, me.id)
 
-    status = member.status  # enum
+    status = member.status
     priv = getattr(member, "privileges", None)
     can_invite = getattr(priv, "can_invite_users", None)
     can_manage = getattr(priv, "can_manage_chat", None)
@@ -57,33 +161,11 @@ async def check_and_log_permission(client: Client, chat_id: int) -> bool:
         return True
     if status != ChatMemberStatus.ADMINISTRATOR:
         return False
-
-    # Even if privileges don't show perfectly, still try (Telegram enforces on action).
     return True
 
 
-async def approve_user(client: Client, chat_id: int, user_id: int, tag: str) -> bool:
-    await rate_limit()
-    try:
-        await client.approve_chat_join_request(chat_id, user_id)
-        log(f"[ACCEPTED] {tag} user_id={user_id}")
-        await asyncio.sleep(PER_APPROVE_DELAY_SEC)
-        return True
-    except FloodWait as e:
-        log(f"[FLOODWAIT] {e.value}s")
-        await asyncio.sleep(e.value)
-        return False
-    except Exception as ex:
-        log(f"[ACCEPT_ERR] {tag} user_id={user_id} ex={ex}")
-        log(traceback.format_exc())
-        return False
-
-
+# ---------------- JOIN REQUEST HELPERS ----------------
 def extract_user_id(item):
-    """
-    Backlog items can be ChatJoiner-like: item.user.id
-    Event items are ChatJoinRequest: req.from_user.id
-    """
     u = getattr(item, "user", None)
     if u is not None:
         uid = getattr(u, "id", None)
@@ -103,42 +185,93 @@ def extract_user_id(item):
     return None
 
 
-async def drain_pending_requests(client: Client, chat_id: int):
-    """
-    Drains backlog until pending is 0.
-    Logs:
-      - [ACCEPTED] for each accepted
-      - [DRAIN_ROUND] accepted_round / pending_seen
-      - [DRAIN_DONE] total accepted
-    """
-    accepted_total = 0
+async def approve_user(client: Client, chat_id: int, user_id: int, tag: str) -> bool:
+    if dup_check_and_mark(user_id):
+        log(f"[SKIP_DUP] user_id={user_id}")
+        return False
 
-    while True:
-        pending = 0
-        accepted_round = 0
+    await rate_limit()
+    b = await get_backoff()
+    if b > 0:
+        await asyncio.sleep(b)
 
-        async for item in client.get_chat_join_requests(chat_id):
-            pending += 1
-            uid = extract_user_id(item)
-            if not uid:
-                log(f"[SKIP] cannot extract user_id from item_type={type(item)}")
-                continue
+    try:
+        await client.approve_chat_join_request(chat_id, user_id)
+        stats["accepted"] += 1
+        stats["smooth_success"] += 1
+        log(f"[ACCEPTED] {tag} user_id={user_id}")
 
-            if await approve_user(client, chat_id, uid, tag="OLD"):
-                accepted_round += 1
+        await decay_backoff()
+        await tune_up_if_smooth()
+        return True
 
-        accepted_total += accepted_round
-        log(f"[DRAIN_ROUND] accepted_round={accepted_round} pending_seen={pending}")
+    except FloodWait as e:
+        stats["floodwaits"] += 1
+        stats["smooth_success"] = 0
+        log(f"[FLOODWAIT] {e.value}s (auto slow)")
+        await bump_backoff(min(10.0, float(e.value)))
+        await tune_down()
+        await asyncio.sleep(e.value)
+        return False
 
-        if pending == 0:
-            break
+    except Exception as ex:
+        stats["accept_errs"] += 1
+        stats["smooth_success"] = 0
+        log(f"[ACCEPT_ERR] {tag} user_id={user_id} ex={ex}")
+        log(traceback.format_exc())
+        await tune_down()
+        return False
 
-        await asyncio.sleep(2)
 
-    log(f"[DRAIN_DONE] accepted_total={accepted_total}")
-    return accepted_total
+async def drain_pending_requests_fast(client: Client, chat_id: int):
+    pending_ids = []
+    async for item in client.get_chat_join_requests(chat_id):
+        uid = extract_user_id(item)
+        if uid:
+            pending_ids.append(uid)
+
+    pending = len(pending_ids)
+    stats["pending_last"] = pending
+
+    if pending == 0:
+        log("[DRAIN] pending_seen=0")
+        return 0, 0
+
+    q = asyncio.Queue()
+    for uid in pending_ids:
+        q.put_nowait(uid)
+
+    accepted = 0
+    accepted_lock = asyncio.Lock()
+
+    async def worker(worker_id: int):
+        nonlocal accepted
+        while True:
+            try:
+                uid = await q.get()
+            except asyncio.CancelledError:
+                return
+
+            try:
+                ok = await approve_user(client, chat_id, uid, tag="OLD")
+                if ok:
+                    async with accepted_lock:
+                        accepted += 1
+            finally:
+                q.task_done()
+
+    workers = [asyncio.create_task(worker(i)) for i in range(CONCURRENCY)]
+    await q.join()
+
+    for w in workers:
+        w.cancel()
+    await asyncio.gather(*workers, return_exceptions=True)
+
+    log(f"[DRAIN_SUMMARY] accepted={accepted} pending_seen={pending}")
+    return accepted, pending
 
 
+# ---------------- MAIN ----------------
 async def main():
     stop_event = asyncio.Event()
 
@@ -158,28 +291,43 @@ async def main():
         session_string=SESSION_STRING,
     )
 
+    async def stats_logger():
+        while not stop_event.is_set():
+            try:
+                apm = await get_apm()
+                b = await get_backoff()
+                log(
+                    "[STATS] "
+                    f"accepted={stats['accepted']} pending_last={stats['pending_last']} "
+                    f"errors={stats['errors']} accept_errs={stats['accept_errs']} "
+                    f"floodwaits={stats['floodwaits']} skipped_dup={stats['skipped_dup']} "
+                    f"apm={apm}/min backoff={b:.2f}s conc={CONCURRENCY}"
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(STATS_INTERVAL_SEC)
+
     async with app:
         log("Userbot started ✅")
+        log(f"[BOOT] conc={CONCURRENCY} start_apm={START_APPROVALS_PER_MIN}/min range={MIN_APPROVALS_PER_MIN}-{MAX_APPROVALS_PER_MIN_CAP}/min")
 
-        # Ensure joined
         try:
             await app.join_chat(INVITE_LINK)
             log("Joined channel via invite link ✅")
         except UserAlreadyParticipant:
             log("Already joined channel ✅")
 
-        # Resolve chat id
         chat = await app.get_chat(INVITE_LINK)
         CHAT_ID = chat.id
         log(f"Resolved chat ID: {CHAT_ID}")
 
-        # Permission check
         ok = await check_and_log_permission(app, CHAT_ID)
         if not ok:
-            log(f"[NO_PERMISSION] chat_id={CHAT_ID} (session user is not admin/owner)")
+            log(f"[NO_PERMISSION] chat_id={CHAT_ID}")
             return
 
-        # New join requests (instant accept)
+        stats_task = asyncio.create_task(stats_logger())
+
         @app.on_chat_join_request()
         async def handler(client: Client, req: ChatJoinRequest):
             try:
@@ -187,21 +335,27 @@ async def main():
                     return
                 await approve_user(client, CHAT_ID, req.from_user.id, tag="NEW")
             except Exception as ex:
+                stats["errors"] += 1
                 log(f"[HANDLER_ERR] {ex}")
                 log(traceback.format_exc())
 
-        # Drain old pending requests completely
-        await drain_pending_requests(app, CHAT_ID)
+        # Initial drain
+        await drain_pending_requests_fast(app, CHAT_ID)
 
         # Periodic rescans
         while not stop_event.is_set():
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=RESCAN_EVERY_MINUTES * 60)
             except asyncio.TimeoutError:
-                await drain_pending_requests(app, CHAT_ID)
+                try:
+                    await drain_pending_requests_fast(app, CHAT_ID)
+                except Exception as ex:
+                    stats["errors"] += 1
+                    log(f"[SCAN_ERR] {ex}")
+                    log(traceback.format_exc())
 
+        stats_task.cancel()
         log("Stopping userbot...")
-
 
 if __name__ == "__main__":
     asyncio.run(main())
