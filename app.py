@@ -16,7 +16,7 @@ API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
 
-INVITE_LINK = "https://t.me/+e8h5_XQmY5szYjUx"
+INVITE_LINK = os.getenv("INVITE_LINK", "https://t.me/+e8h5_XQmY5szYjUx")
 
 # Speed controls (tune via env vars)
 MAX_APPROVALS_PER_MINUTE = int(os.getenv("MAX_APPROVALS_PER_MINUTE", "80"))   # was 50
