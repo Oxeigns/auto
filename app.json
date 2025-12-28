@@ -24,7 +24,7 @@
 
     "INVITE_LINK": {
       "description": "Channel invite link (https://t.me/+xxxx) or @username (only used if you update app.py to read env)",
-      "value": "https://t.me/+e8h5_XQmY5szYjUx",
+      "value": "https://t.me/+C7TFqdyvcX8wZWFh",
       "required": false
     },
 
